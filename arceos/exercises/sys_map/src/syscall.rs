@@ -1,12 +1,15 @@
 #![allow(dead_code)]
 
 use core::ffi::{c_void, c_char, c_int};
+use alloc::vec;
 use axhal::arch::TrapFrame;
 use axhal::trap::{register_trap_handler, SYSCALL};
 use axerrno::LinuxError;
 use axtask::current;
 use axtask::TaskExtRef;
+use axhal::mem::{MemoryAddr, VirtAddr};
 use axhal::paging::MappingFlags;
+use memory_addr::VirtAddrRange;
 use arceos_posix_api as api;
 
 const SYS_IOCTL: usize = 29;
@@ -140,7 +143,55 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    use axhal::mem::PAGE_SIZE_4K;
+
+    let prot = MmapProt::from_bits_truncate(prot);
+    let flags = MmapFlags::from_bits_truncate(flags);
+
+    // The mapping must cover complete pages.
+    let length = (length.max(1) + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+
+    let hint = if addr.is_null() {
+        0x1000
+    } else {
+        addr as usize
+    };
+
+    let curr = current();
+    let aspace = curr.task_ext().aspace.clone();
+    let mut aspace = aspace.lock();
+
+    let limit = VirtAddrRange::from_start_size(aspace.base(), aspace.size());
+    let vaddr = if flags.contains(MmapFlags::MAP_FIXED) {
+        VirtAddr::from_usize(hint)
+    } else {
+        match aspace.find_free_area(VirtAddr::from_usize(hint), length, limit) {
+            Some(vaddr) => vaddr,
+            None => return -LinuxError::ENOMEM.code() as isize,
+        }
+    };
+
+    if aspace
+        .map_alloc(vaddr, length, prot.into(), true)
+        .is_err()
+    {
+        return -LinuxError::ENOMEM.code() as isize;
+    }
+
+    // Copy the file contents into the newly mapped area.
+    if !flags.contains(MmapFlags::MAP_ANONYMOUS) {
+        let mut buf = vec![0u8; length];
+        let n = api::sys_read(fd, buf.as_mut_ptr() as *mut c_void, length);
+        if n < 0 {
+            return n as isize;
+        }
+        let n = (n as usize).min(length);
+        if n > 0 && aspace.write(vaddr, &buf[..n]).is_err() {
+            return -LinuxError::EFAULT.code() as isize;
+        }
+    }
+
+    vaddr.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

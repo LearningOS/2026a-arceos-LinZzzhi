@@ -165,6 +165,47 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        log::debug!("rename at ramfs: {} -> {}", src_path, dst_path);
+        let (src_name, src_rest) = split_path(src_path);
+        let (dst_name, dst_rest) = split_path(dst_path);
+
+        match (src_rest, dst_rest) {
+            // Rename within this directory.
+            (None, None) => {
+                if src_name.is_empty() || dst_name.is_empty() {
+                    return Err(VfsError::InvalidInput);
+                }
+                let mut children = self.children.write();
+                if !children.contains_key(src_name) {
+                    return Err(VfsError::NotFound);
+                }
+                // Renaming to the same name is a no-op.
+                if src_name == dst_name {
+                    return Ok(());
+                }
+                if children.contains_key(dst_name) {
+                    return Err(VfsError::AlreadyExists);
+                }
+                let node = children.remove(src_name).unwrap();
+                children.insert(dst_name.into(), node);
+                Ok(())
+            }
+            // Both paths go through the same sub-directory: recurse.
+            (Some(src_rest), Some(dst_rest)) if src_name == dst_name => {
+                let subdir = self
+                    .children
+                    .read()
+                    .get(src_name)
+                    .cloned()
+                    .ok_or(VfsError::NotFound)?;
+                subdir.rename(src_rest, dst_rest)
+            }
+            // Moving between directories is not supported.
+            _ => Err(VfsError::Unsupported),
+        }
+    }
+
     axfs_vfs::impl_vfs_dir_default! {}
 }
 
